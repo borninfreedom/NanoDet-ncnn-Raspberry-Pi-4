@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <vector>
 #include <iostream>
+#include <thread>
 
 ncnn::Net nanodet;
 
@@ -137,8 +138,11 @@ static void nms_sorted_bboxes(const std::vector<Object>& faceobjects, std::vecto
     }
 }
 
+
+
 static void generate_proposals(const ncnn::Mat& cls_pred, const ncnn::Mat& dis_pred, int stride, const ncnn::Mat& in_pad, float prob_threshold, std::vector<Object>& objects)
 {
+
     const int num_grid = cls_pred.h;
 
     int num_grid_x;
@@ -241,6 +245,7 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
     int width = bgr.cols;
     int height = bgr.rows;
 
+
     // pad to multiple of 32
     int w = width;
     int h = height;
@@ -257,29 +262,40 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
         h = target_size;
         w = w * scale;
     }
-
+    // from_pixels_resize将cv::Mat数据转换到ncnn::Mat同时进行resize操作
     ncnn::Mat in = ncnn::Mat::from_pixels_resize(bgr.data, ncnn::Mat::PIXEL_BGR, width, height, w, h);
 
+
     // pad to target_size rectangle
+    // 这两个公式的作用是将 w 填充到32的倍数，需要 pad 多少，比如 w = 1，需要 pad 31才能到32， w=63，需要 pad 1到64
     int wpad = (w + 31) / 32 * 32 - w;
     int hpad = (h + 31) / 32 * 32 - h;
+
+
+    //std::cout<<""<<std::endl;
     ncnn::Mat in_pad;
+
+    // in_pad是目标Mat，函数的作用是在原输入上，进行pad，扩充边界
     ncnn::copy_make_border(in, in_pad, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, ncnn::BORDER_CONSTANT, 0.f);
 
+    // 减均值和norm操作，mean和norm的值怎么获得，目前还没研究
     in_pad.substract_mean_normalize(mean_vals, norm_vals);
+
 
     ncnn::Extractor ex = nanodet.create_extractor();
 
+    //input的名字需要根据.param文件，使用netron可视化，查看input的名字来确定
     ex.input("input.1", in_pad);
 
     std::vector<Object> proposals;
+
 
     // stride 8
     {
         ncnn::Mat cls_pred;
         ncnn::Mat dis_pred;
-        ex.extract("792", cls_pred);
-        ex.extract("795", dis_pred);
+        ex.extract("cls_pred_stride_8", cls_pred);
+        ex.extract("dis_pred_stride_8", dis_pred);
 
         std::vector<Object> objects8;
         generate_proposals(cls_pred, dis_pred, 8, in_pad, prob_threshold, objects8);
@@ -291,8 +307,8 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
     {
         ncnn::Mat cls_pred;
         ncnn::Mat dis_pred;
-        ex.extract("814", cls_pred);
-        ex.extract("817", dis_pred);
+        ex.extract("cls_pred_stride_16", cls_pred);
+        ex.extract("dis_pred_stride_16", dis_pred);
 
         std::vector<Object> objects16;
         generate_proposals(cls_pred, dis_pred, 16, in_pad, prob_threshold, objects16);
@@ -304,8 +320,8 @@ static int detect_nanodet(const cv::Mat& bgr, std::vector<Object>& objects)
     {
         ncnn::Mat cls_pred;
         ncnn::Mat dis_pred;
-        ex.extract("836", cls_pred);
-        ex.extract("839", dis_pred);
+        ex.extract("cls_pred_stride_32", cls_pred);
+        ex.extract("dis_pred_stride_32", dis_pred);
 
         std::vector<Object> objects32;
         generate_proposals(cls_pred, dis_pred, 32, in_pad, prob_threshold, objects32);
@@ -363,6 +379,7 @@ int main(int argc, char** argv)
     float FPS[16];
     int i,Fcnt=0;
     cv::Mat frame;
+
     //some timing
     std::chrono::steady_clock::time_point Tbegin, Tend;
 
@@ -370,6 +387,7 @@ int main(int argc, char** argv)
 
     // original pretrained model from https://github.com/RangiLyu/nanodet
     // the ncnn model https://github.com/nihui/ncnn-assets/tree/master/models
+    // ncnn使用.param和.bin文件来表示转换后的部署文件
     nanodet.load_param("nanodet_m.param");
     nanodet.load_model("nanodet_m.bin");
 
@@ -380,9 +398,13 @@ int main(int argc, char** argv)
     }
 
     std::cout << "Start grabbing, press ESC on Live window to terminate" << std::endl;
+    float total_fps=0;
+    int total_frames=0;
 	while(1){
 //        frame=imread("parking.jpg");  //need to refresh frame before dnn class detection
         cap >> frame;
+        total_frames++;
+
         if (frame.empty()) {
             std::cerr << "ERROR: Unable to grab from the camera" << std::endl;
             break;
@@ -391,23 +413,35 @@ int main(int argc, char** argv)
         Tbegin = std::chrono::steady_clock::now();
 
         std::vector<Object> objects;
+
+        // 主检测函数
         detect_nanodet(frame, objects);
+
         draw_objects(frame, objects);
 
         Tend = std::chrono::steady_clock::now();
 
         //calculate frame rate
         f = std::chrono::duration_cast <std::chrono::milliseconds> (Tend - Tbegin).count();
+        // 0x0F的作用是将((Fcnt++)&0x0F)的值限制在0-15
         if(f>0.0) FPS[((Fcnt++)&0x0F)]=1000.0/f;
         for(f=0.0, i=0;i<16;i++){ f+=FPS[i]; }
+        total_fps+=f;
+
+        // 这里的FPS取得是前16帧的平均值
         putText(frame, cv::format("FPS %0.2f", f/16),cv::Point(10,20),cv::FONT_HERSHEY_SIMPLEX,0.6, cv::Scalar(0, 0, 255));
 
         //show output
-        imshow("RPi 4 - 1,95 GHz - 2 Mb RAM", frame);
+        imshow("RPi 4 - 2 GHz - 2 Mb RAM", frame);
 
         char esc = cv::waitKey(5);
         if(esc == 27) break;
+
+        //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
+    std::cout<<"Total fps is "<<total_fps<<std::endl;
+    std::cout<<"Total frames is "<<total_frames<<std::endl;
+    std::cout<<"Average fps is "<<total_fps/16/total_frames<<std::endl;
 
     std::cout << "Closing the camera" << std::endl;
     cv::destroyAllWindows();
